@@ -1,0 +1,269 @@
+# bot.py —— 複数チャンネル対応 / モーダル即ログ / 全ログ収集 / ヘルスHTTP（Railway向け）
+
+import os, sys, traceback
+import discord
+import requests
+from discord.ext import commands
+from discord import ui
+from dotenv import load_dotenv
+from aiohttp import web
+
+print("[boot] starting bot.py")
+
+# ====== ヘルスチェックHTTP（Freeプラン延命や監視用） ======
+async def _health(request):
+    return web.Response(text="ok")
+
+async def start_web():
+    app = web.Application()
+    app.add_routes([web.get("/", _health)])
+    runner = web.AppRunner(app); await runner.setup()
+    port = int(os.getenv("PORT", "8080"))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"[web] health server on :{port}")
+
+# ====== .env ======
+load_dotenv()
+TOKEN    = os.getenv("DISCORD_TOKEN")
+GUILD_ID = os.getenv("GUILD_ID")  # サーバー限定同期に使う（任意）
+
+def _parse_ids(s: str | None) -> set[int]:
+    """カンマ区切りのID文字列を {int, ...} に変換"""
+    if not s:
+        return set()
+    out = set()
+    for part in s.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.add(int(part))
+        except ValueError:
+            pass
+    return out
+
+# ほうれんそう / 質問箱 を複数チャンネル対応
+HRS_IDS  = _parse_ids(os.getenv("CHANNEL_HRS"))   # 例: "111,222,333"
+QBOX_IDS = _parse_ids(os.getenv("CHANNEL_QBOX"))  # 例: "444"
+
+GAS_URL  = os.getenv("GAS_URL")
+GAS_KEY  = os.getenv("GAS_SHARED_TOKEN", "")
+
+if not TOKEN or TOKEN.strip() == "":
+    print("[boot][ERROR] DISCORD_TOKEN が読み込めていません。.env / Variables を確認してください。")
+    sys.exit(1)
+
+print("[boot] env ok. token length:", len(TOKEN))
+print("[boot] HRS_IDS=", HRS_IDS, "QBOX_IDS=", QBOX_IDS)
+
+# ====== intents / bot ======
+intents = discord.Intents.default()
+intents.message_content = True   # on_message に必須
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+# ====== チャンネル別タグ定義 ======
+TAG_SETS: dict[int, list[tuple[str, str]]] = {}
+for cid in HRS_IDS:
+    TAG_SETS[cid] = [("報告", "#報告 "), ("連絡", "#連絡 "), ("相談", "#相談 "), ("共有", "#共有 ")]
+for cid in QBOX_IDS:
+    TAG_SETS[cid] = [("質問", "#質問 "), ("不具合", "#不具合 "), ("お願い", "#お願い ")]
+
+STYLE_ROTATION = [
+    discord.ButtonStyle.primary,
+    discord.ButtonStyle.success,
+    discord.ButtonStyle.danger,
+    discord.ButtonStyle.secondary,
+]
+
+# ====== モーダル：押す→本文入力→GAS直送 ======
+class TagInputModal(ui.Modal, title="記録内容を入力"):
+    def __init__(self, tag_text: str):
+        super().__init__(timeout=300)
+        self.tag_text = tag_text
+        self.text = ui.TextInput(
+            label="本文（任意）",
+            style=discord.TextStyle.paragraph,
+            required=False,
+            max_length=1000,
+            placeholder="例）#報告 利用者A 服薬忘れ → 対応済み"
+        )
+        self.add_item(self.text)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        # 先にACK（3秒タイムアウト回避）
+        try:
+            await interaction.response.defer(ephemeral=True, thinking=True)
+        except Exception:
+            pass
+
+        if not GAS_URL:
+            await interaction.followup.send("GAS_URL 未設定（Variables）", ephemeral=True)
+            return
+
+        chan_name = getattr(interaction.channel, "name", str(interaction.channel_id))
+        content = (self.tag_text + (self.text.value or "")).strip()
+
+        try:
+            r = requests.post(
+                GAS_URL,
+                json={"token": GAS_KEY, "channel": chan_name,
+                      "user": interaction.user.display_name, "content": content},
+                timeout=8
+            )
+            print(f"[modal->POST] {r.status_code}")
+            await interaction.followup.send(f"記録しました（{r.status_code}）", ephemeral=True)
+        except Exception as e:
+            print("[modal POST error]:", e)
+            await interaction.followup.send(f"送信エラー: {e}", ephemeral=True)
+
+# ====== 常設ボタン View（チャンネル単位） ======
+class PersistentTagView(ui.View):
+    """ custom_id = tag:{channel_id}:{index} """
+    def __init__(self, channel_id: int):
+        super().__init__(timeout=None)
+        items = TAG_SETS.get(channel_id) or []
+        for i, (label, tag_text) in enumerate(items):
+            style = STYLE_ROTATION[i % len(STYLE_ROTATION)]
+            custom_id = f"tag:{channel_id}:{i}"
+            self.add_item(ui.Button(label=label, style=style, custom_id=custom_id))
+
+# ====== ボタン押下 → モーダル ======
+@bot.event
+async def on_interaction(interaction: discord.Interaction):
+    if interaction.type != discord.InteractionType.component:
+        return
+    data = interaction.data or {}
+    cid = data.get("custom_id", "")
+    if not isinstance(cid, str) or not cid.startswith("tag:"):
+        return
+    try:
+        _, chan_id_str, idx_str = cid.split(":")
+        chan_id = int(chan_id_str); idx = int(idx_str)
+    except Exception:
+        return
+    items = TAG_SETS.get(chan_id)
+    if not items or not (0 <= idx < len(items)):
+        return
+    _, tag_text = items[idx]
+    await interaction.response.send_modal(TagInputModal(tag_text))
+
+# ====== /tags_pin（このチャンネルにボタンを公開で貼る→ピン推奨） ======
+@bot.tree.command(name="tags_pin", description="このチャンネルにタグボタンを常設します（公開）")
+async def tags_pin(interaction: discord.Interaction):
+    cid = interaction.channel_id
+    items = TAG_SETS.get(cid)
+    if not items:
+        await interaction.response.send_message(
+            "このチャンネル用のタグセットが未定義です（.env の CHANNEL_HRS/CHANNEL_QBOX にこのチャンネルIDを追加）。",
+            ephemeral=True
+        )
+        return
+    await interaction.response.send_message("タグを選んでください：",
+                                            view=PersistentTagView(cid),
+                                            ephemeral=False)
+
+# ====== /log（手動送信） ======
+@bot.tree.command(name="log", description="内容をスプレッドシートに記録します")
+async def _log(interaction: discord.Interaction, content: str):
+    await interaction.response.defer(ephemeral=True)
+    if not GAS_URL:
+        await interaction.followup.send("GAS_URL未設定（Variables）", ephemeral=True)
+        return
+    chan_obj = interaction.channel
+    chan_name = getattr(chan_obj, "name", None) or (
+        f"{interaction.guild.name}#{interaction.channel_id}" if interaction.guild else str(interaction.channel_id)
+    )
+    payload = {"token": GAS_KEY, "channel": chan_name,
+               "user": interaction.user.display_name, "content": content}
+    try:
+        r = requests.post(GAS_URL, json=payload, timeout=8)
+        print("[/log->POST]", r.status_code, r.text[:120])
+        await interaction.followup.send(f"status={r.status_code}, body={r.text[:120]}", ephemeral=True)
+    except Exception as e:
+        print("[/log POST error]", e)
+        await interaction.followup.send(f"送信エラー: {e}", ephemeral=True)
+
+# ====== 全ログ収集（HRS_IDS 対象） ======
+def _in_targets(message: discord.Message, targets: set[int]) -> bool:
+    cid = getattr(message.channel, "id", None)
+    pid = getattr(getattr(message.channel, "parent", None), "id", None)  # スレッドの親
+    return bool(targets) and (cid in targets or (pid and pid in targets))
+
+@bot.event
+async def on_message(message: discord.Message):
+    try:
+        gid = getattr(message.guild, "id", None)
+        cid = getattr(message.channel, "id", None)
+        cname = getattr(message.channel, "name", None)
+        pid = getattr(getattr(message.channel, "parent", None), "id", None)
+        print(f"[recv] guild={gid} ch={cid} name={cname} parent={pid} "
+              f"author_bot={message.author.bot} len={len(message.content or '')}")
+    except Exception as e:
+        print("[recv] log error:", e)
+
+    if message.author.bot:
+        return
+
+    if _in_targets(message, HRS_IDS) and GAS_URL:
+        payload = {"token": GAS_KEY, "channel": cname or str(cid),
+                   "user": message.author.display_name, "content": message.content or ""}
+        try:
+            r = requests.post(GAS_URL, json=payload, timeout=6)
+            print(f"[on_message->POST] -> {r.status_code}")
+        except Exception as e:
+            print("[on_message POST error]:", e)
+
+    await bot.process_commands(message)
+
+# ====== 同期 & 起動 ======
+@bot.event
+async def setup_hook():
+    try:
+        if GUILD_ID:
+            guild = discord.Object(id=int(GUILD_ID))
+            bot.tree.copy_global_to(guild=guild)
+            synced = await bot.tree.sync(guild=guild)
+            print(f"[sync] to guild {GUILD_ID}: {[c.name for c in synced]}")
+        else:
+            synced = await bot.tree.sync()
+            print(f"[sync] global: {[c.name for c in synced]}")
+    except Exception:
+        print("[sync][ERROR]")
+        traceback.print_exc()
+
+@bot.event
+async def on_ready():
+    print(f"[ready] Logged in as {bot.user} (id={bot.user.id})")
+    print("[ready] Guilds:", [(g.name, g.id) for g in bot.guilds])
+    print("[ready] HRS_IDS =", HRS_IDS, "QBOX_IDS =", QBOX_IDS)
+
+    # 永続ボタン（定義された全チャンネル分）
+    for cid in TAG_SETS.keys():
+        bot.add_view(PersistentTagView(cid))
+    print("[ready] persistent views registered")
+
+    # ヘルスHTTP（多重起動ガード）
+    if not getattr(bot, "_web_started", False):
+        bot._web_started = True
+        bot.loop.create_task(start_web())
+
+# ====== エラーハンドラ / 起動 ======
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error):
+    print("[appcmd][ERROR]:", repr(error))
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send("エラーが発生（詳細はコンソール）", ephemeral=True)
+        else:
+            await interaction.response.send_message("エラーが発生（詳細はコンソール）", ephemeral=True)
+    except Exception as e:
+        print("[appcmd][notify-fail]:", e)
+
+try:
+    print("[run] starting client...")
+    bot.run(TOKEN)
+except Exception:
+    print("[run][FATAL] uncaught exception")
+    traceback.print_exc()
+    sys.exit(1)
