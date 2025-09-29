@@ -184,6 +184,10 @@ async def _log(interaction: discord.Interaction, content: str):
         print("[/log POST error]", e)
         await interaction.followup.send(f"送信エラー: {e}", ephemeral=True)
 
+@bot.tree.command(name="ping", description="応答テスト")
+async def _ping(interaction: discord.Interaction):
+    await interaction.response.send_message("pong", ephemeral=True)
+
 # ====== 全ログ収集（HRS_IDS 対象） ======
 def _in_targets(message: discord.Message, targets: set[int]) -> bool:
     cid = getattr(message.channel, "id", None)
