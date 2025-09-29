@@ -13,7 +13,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # アプリ本体
 COPY . .
-
+EXPOSE 8080
 # 本番は Railway の Variables から環境変数を渡すので .env は不要
 # そのまま起動
 CMD ["python", "bot.py"]
+
