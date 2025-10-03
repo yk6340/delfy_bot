@@ -117,6 +117,16 @@ class TagInputModal(ui.Modal, title="記録内容を入力"):
             print("[modal POST error]:", e)
             await interaction.followup.send(f"送信エラー: {e}", ephemeral=True)
 
+@bot.tree.command(name="sync", description="コマンド同期")
+async def _sync(interaction: discord.Interaction):
+    gid = os.getenv("GUILD_ID")
+    if gid:
+        synced = await bot.tree.sync(guild=discord.Object(id=int(gid)))
+        await interaction.response.send_message(f"synced: {[c.name for c in synced]}", ephemeral=True)
+    else:
+        synced = await bot.tree.sync()
+        await interaction.response.send_message(f"global synced: {[c.name for c in synced]}", ephemeral=True)
+
 # ====== 常設ボタン View（チャンネル単位） ======
 class PersistentTagView(ui.View):
     """ custom_id = tag:{channel_id}:{index} """
