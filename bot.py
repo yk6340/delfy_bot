@@ -1,4 +1,4 @@
-# bot.py —— 複数チャンネル対応 / モーダル即ログ / 全ログ収集 / ヘルスHTTP（Railway向け）
+# bot.py —— 複数チャンネル対応 / モーダル即ログ / HRS全量ログ / QBOX&HEALTHはボタンのみ / ヘルスHTTP
 
 import os, sys, traceback
 import discord
@@ -43,9 +43,10 @@ def _parse_ids(s: str | None) -> set[int]:
             pass
     return out
 
-# ほうれんそう / 質問箱 を複数チャンネル対応
-HRS_IDS  = _parse_ids(os.getenv("CHANNEL_HRS"))   # 例: "111,222,333"
-QBOX_IDS = _parse_ids(os.getenv("CHANNEL_QBOX"))  # 例: "444"
+# 複数チャンネル対応：HRS（職員ほうれんそう）/ QBOX（質問箱）/ HEALTH（健康・おくすり相談）
+HRS_IDS     = _parse_ids(os.getenv("CHANNEL_HRS"))
+QBOX_IDS    = _parse_ids(os.getenv("CHANNEL_QBOX"))
+HEALTH_IDS  = _parse_ids(os.getenv("CHANNEL_HEALTH"))
 
 GAS_URL  = os.getenv("GAS_URL")
 GAS_KEY  = os.getenv("GAS_SHARED_TOKEN", "")
@@ -55,19 +56,56 @@ if not TOKEN or TOKEN.strip() == "":
     sys.exit(1)
 
 print("[boot] env ok. token length:", len(TOKEN))
-print("[boot] HRS_IDS=", HRS_IDS, "QBOX_IDS=", QBOX_IDS)
+print("[boot] HRS_IDS =", HRS_IDS, "QBOX_IDS =", QBOX_IDS, "HEALTH_IDS =", HEALTH_IDS)
 
 # ====== intents / bot ======
 intents = discord.Intents.default()
 intents.message_content = True   # on_message に必須
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+# ====== チャンネル種別→シート名のマップ ======
+SHEET_BY_KIND = {
+    "HRS": "discord_logs",
+    "QBOX": "qbox_logs",
+    "HEALTH": "health_logs",
+}
+
+def channel_kind_and_sheet(channel_id: int) -> tuple[str | None, str | None]:
+    """チャンネルIDから ('HRS'|'QBOX'|'HEALTH', シート名) を返す"""
+    if channel_id in HRS_IDS:
+        return "HRS", SHEET_BY_KIND["HRS"]
+    if channel_id in QBOX_IDS:
+        return "QBOX", SHEET_BY_KIND["QBOX"]
+    if channel_id in HEALTH_IDS:
+        return "HEALTH", SHEET_BY_KIND["HEALTH"]
+    return None, None
+
 # ====== チャンネル別タグ定義 ======
 TAG_SETS: dict[int, list[tuple[str, str]]] = {}
+
+# HRS（職員ほうれんそう）
 for cid in HRS_IDS:
-    TAG_SETS[cid] = [("報告", "#報告 "), ("連絡", "#連絡 "), ("相談", "#相談 "), ("共有", "#共有 ")]
+    TAG_SETS[cid] = [
+        ("報告", "#報告 "),
+        ("連絡", "#連絡 "),
+        ("相談", "#相談 "),
+        ("共有", "#共有 "),
+    ]
+
+# QBOX（質問箱）
 for cid in QBOX_IDS:
-    TAG_SETS[cid] = [("質問", "#質問 "), ("不具合", "#不具合 "), ("お願い", "#お願い ")]
+    TAG_SETS[cid] = [
+        ("質問", "#質問 "),
+        ("相談", "#相談 "),
+        ("提案", "#提案 "),
+    ]
+
+# HEALTH（健康・おくすり相談）
+for cid in HEALTH_IDS:
+    TAG_SETS[cid] = [
+        ("健康相談", "#健康相談 "),
+        ("お薬相談", "#お薬相談 "),
+    ]
 
 STYLE_ROTATION = [
     discord.ButtonStyle.primary,
@@ -76,7 +114,7 @@ STYLE_ROTATION = [
     discord.ButtonStyle.secondary,
 ]
 
-# ====== モーダル：押す→本文入力→GAS直送 ======
+# ====== モーダル：押す→本文入力→GAS直送（シート振り分け） ======
 class TagInputModal(ui.Modal, title="記録内容を入力"):
     def __init__(self, tag_text: str):
         super().__init__(timeout=300)
@@ -86,7 +124,7 @@ class TagInputModal(ui.Modal, title="記録内容を入力"):
             style=discord.TextStyle.paragraph,
             required=False,
             max_length=1000,
-            placeholder="例）#報告 利用者A 服薬忘れ → 対応済み"
+            placeholder="例）#健康相談 食欲がない／#お薬相談 朝の服薬を忘れがち など"
         )
         self.add_item(self.text)
 
@@ -101,22 +139,36 @@ class TagInputModal(ui.Modal, title="記録内容を入力"):
             await interaction.followup.send("GAS_URL 未設定（Variables）", ephemeral=True)
             return
 
-        chan_name = getattr(interaction.channel, "name", str(interaction.channel_id))
+        # どのシートに書くか：チャンネルID→種別→シート名
+        cid = interaction.channel_id
+        kind, sheet = channel_kind_and_sheet(cid)
+        if not sheet:
+            # 未定義チャンネルなら安全側で拒否
+            await interaction.followup.send("このチャンネルは記録の対象外です。", ephemeral=True)
+            return
+
+        chan_name = getattr(interaction.channel, "name", str(cid))
         content = (self.tag_text + (self.text.value or "")).strip()
 
         try:
             r = requests.post(
                 GAS_URL,
-                json={"token": GAS_KEY, "channel": chan_name,
-                      "user": interaction.user.display_name, "content": content},
+                json={
+                    "token": GAS_KEY,
+                    "sheet": sheet,  # ★ シート名を明示
+                    "channel": chan_name,
+                    "user": interaction.user.display_name,
+                    "content": content,
+                },
                 timeout=8
             )
-            print(f"[modal->POST] {r.status_code}")
+            print(f"[modal->POST] {r.status_code} (sheet={sheet})")
             await interaction.followup.send(f"記録しました（{r.status_code}）", ephemeral=True)
         except Exception as e:
             print("[modal POST error]:", e)
             await interaction.followup.send(f"送信エラー: {e}", ephemeral=True)
 
+# ====== /sync（任意） ======
 @bot.tree.command(name="sync", description="コマンド同期")
 async def _sync(interaction: discord.Interaction):
     gid = os.getenv("GUILD_ID")
@@ -165,7 +217,7 @@ async def tags_pin(interaction: discord.Interaction):
     items = TAG_SETS.get(cid)
     if not items:
         await interaction.response.send_message(
-            "このチャンネル用のタグセットが未定義です（.env の CHANNEL_HRS/CHANNEL_QBOX にこのチャンネルIDを追加）。",
+            "このチャンネル用のタグセットが未定義です（.env の CHANNEL_HRS/CHANNEL_QBOX/CHANNEL_HEALTH にこのチャンネルIDを追加）。",
             ephemeral=True
         )
         return
@@ -173,19 +225,31 @@ async def tags_pin(interaction: discord.Interaction):
                                             view=PersistentTagView(cid),
                                             ephemeral=False)
 
-# ====== /log（手動送信） ======
-@bot.tree.command(name="log", description="内容をスプレッドシートに記録します")
+# ====== /log（手動送信：HRSのみ許可） ======
+@bot.tree.command(name="log", description="内容をスプレッドシートに記録します（HRSのみ）")
 async def _log(interaction: discord.Interaction, content: str):
     await interaction.response.defer(ephemeral=True)
     if not GAS_URL:
         await interaction.followup.send("GAS_URL未設定（Variables）", ephemeral=True)
         return
+
+    # HRSのみ許可（QBOX/HEALTHはボタンからのみ）
+    kind, sheet = channel_kind_and_sheet(interaction.channel_id)
+    if kind != "HRS":
+        await interaction.followup.send("このチャンネルはボタンからのみ記録できます。", ephemeral=True)
+        return
+
     chan_obj = interaction.channel
     chan_name = getattr(chan_obj, "name", None) or (
         f"{interaction.guild.name}#{interaction.channel_id}" if interaction.guild else str(interaction.channel_id)
     )
-    payload = {"token": GAS_KEY, "channel": chan_name,
-               "user": interaction.user.display_name, "content": content}
+    payload = {
+        "token": GAS_KEY,
+        "sheet": sheet,
+        "channel": chan_name,
+        "user": interaction.user.display_name,
+        "content": content
+    }
     try:
         r = requests.post(GAS_URL, json=payload, timeout=8)
         print("[/log->POST]", r.status_code, r.text[:120])
@@ -198,12 +262,13 @@ async def _log(interaction: discord.Interaction, content: str):
 async def _ping(interaction: discord.Interaction):
     await interaction.response.send_message("pong", ephemeral=True)
 
-# ====== 全ログ収集（HRS_IDS 対象） ======
+# ====== 判定ユーティリティ ======
 def _in_targets(message: discord.Message, targets: set[int]) -> bool:
     cid = getattr(message.channel, "id", None)
-    pid = getattr(getattr(message.channel, "parent", None), "id", None)  # スレッドの親
+    pid = getattr(getattr(message.channel, "parent", None), "id", None)  # スレッド親
     return bool(targets) and (cid in targets or (pid and pid in targets))
 
+# ====== 全ログ収集：HRSのみ通常メッセを記録 ======
 @bot.event
 async def on_message(message: discord.Message):
     try:
@@ -219,15 +284,26 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
+    # HRSは通常メッセも収集
     if _in_targets(message, HRS_IDS) and GAS_URL:
-        payload = {"token": GAS_KEY, "channel": cname or str(cid),
-                   "user": message.author.display_name, "content": message.content or ""}
+        _, sheet = channel_kind_and_sheet(
+            getattr(message.channel, "id", 0) if message.channel else 0
+        )
+        sheet = sheet or SHEET_BY_KIND["HRS"]
+        payload = {
+            "token": GAS_KEY,
+            "sheet": sheet,
+            "channel": cname or str(cid),
+            "user": message.author.display_name,
+            "content": message.content or ""
+        }
         try:
             r = requests.post(GAS_URL, json=payload, timeout=6)
-            print(f"[on_message->POST] -> {r.status_code}")
+            print(f"[on_message->POST] -> {r.status_code} (sheet={sheet})")
         except Exception as e:
             print("[on_message POST error]:", e)
 
+    # これが無いと / コマンドが動かなくなる
     await bot.process_commands(message)
 
 # ====== 同期 & 起動 ======
@@ -250,7 +326,7 @@ async def setup_hook():
 async def on_ready():
     print(f"[ready] Logged in as {bot.user} (id={bot.user.id})")
     print("[ready] Guilds:", [(g.name, g.id) for g in bot.guilds])
-    print("[ready] HRS_IDS =", HRS_IDS, "QBOX_IDS =", QBOX_IDS)
+    print("[ready] HRS_IDS =", HRS_IDS, "QBOX_IDS =", QBOX_IDS, "HEALTH_IDS =", HEALTH_IDS)
 
     # 永続ボタン（定義された全チャンネル分）
     for cid in TAG_SETS.keys():
