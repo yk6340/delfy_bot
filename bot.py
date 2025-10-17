@@ -31,11 +31,13 @@ GAS_URL  = os.getenv("GAS_URL")
 GAS_KEY  = os.getenv("GAS_SHARED_TOKEN", "")
 
 def _parse_ids(s: str | None) -> set[int]:
-    if not s: return set()
+    if not s:
+        return set()
     out = set()
     for part in s.split(","):
         p = part.strip()
-        if not p: continue
+        if not p:
+            continue
         try:
             out.add(int(p))
         except ValueError:
@@ -52,6 +54,7 @@ if not TOKEN or TOKEN.strip() == "":
 print("[boot] env ok. token length:", len(TOKEN))
 print("[boot] HRS_IDS=", HRS_IDS, "QBOX_IDS=", QBOX_IDS, "HEALTH_IDS=", HEALTH_IDS)
 
+# ===== intents / bot =====
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
@@ -71,6 +74,7 @@ STYLE_ROTATION = [
     discord.ButtonStyle.danger,
     discord.ButtonStyle.secondary,
 ]
+
 # ===== モーダル：押す→本文入力→GAS直送 =====
 class TagInputModal(ui.Modal, title="記録内容を入力"):
     def __init__(self, tag_text: str, sheet_key: str):
@@ -104,8 +108,7 @@ class TagInputModal(ui.Modal, title="記録内容を入力"):
             "channel": chan_name,
             "user": interaction.user.display_name,
             "content": content,
-            # ← これでGAS側がシートを出し分けできる
-            "sheet": self.sheet_key,      # "default" or "health"
+            "sheet": self.sheet_key,  # "default" or "health"
         }
 
         try:
@@ -147,19 +150,17 @@ async def on_interaction(interaction: discord.Interaction):
         return
 
     _, tag_text = items[idx]
-
-    # HEALTHチャンネルなら health シートへ、他は default
     sheet_key = "health" if chan_id in HEALTH_IDS else "default"
     await interaction.response.send_modal(TagInputModal(tag_text, sheet_key))
 
-# ===== /tags_pin（各チャンネル本体で実行→ピン留め推奨） =====
+# ===== /tags_pin（各チャンネルで実行→ピン留め推奨） =====
 @bot.tree.command(name="tags_pin", description="このチャンネルにタグボタンを常設します（公開）")
 async def tags_pin(interaction: discord.Interaction):
     cid = interaction.channel_id
     items = TAG_SETS.get(cid)
     if not items:
         await interaction.response.send_message(
-            "このチャンネル用のタグセットが未定義です（Variablesの CHANNEL_* にこのチャンネルIDを追加してください）。",
+            "このチャンネル用のタグセットが未定義です（Variablesの CHANNEL_* にこのチャンネルIDを追加）。",
             ephemeral=True
         )
         return
@@ -179,8 +180,6 @@ async def _log(interaction: discord.Interaction, content: str):
     chan_name = getattr(chan_obj, "name", None) or (
         f"{interaction.guild.name}#{interaction.channel_id}" if interaction.guild else str(interaction.channel_id)
     )
-
-    # 手動ログは「基本 default」。健康相談チャンネルで使われたら health に寄せてもOK
     sheet_key = "health" if interaction.channel_id in HEALTH_IDS else "default"
 
     payload = {
@@ -198,13 +197,25 @@ async def _log(interaction: discord.Interaction, content: str):
         print("[/log POST error]", e)
         await interaction.followup.send(f"送信エラー: {e}", ephemeral=True)
 
+# ===== ping / sync =====
 @bot.tree.command(name="ping", description="応答テスト")
 async def _ping(interaction: discord.Interaction):
     await interaction.response.send_message("pong", ephemeral=True)
+
+@bot.tree.command(name="sync", description="コマンド同期（権限者のみ）")
+async def _sync(interaction: discord.Interaction):
+    gid = os.getenv("GUILD_ID")
+    if gid:
+        synced = await bot.tree.sync(guild=discord.Object(id=int(gid)))
+        await interaction.response.send_message(f"synced: {[c.name for c in synced]}", ephemeral=True)
+    else:
+        synced = await bot.tree.sync()
+        await interaction.response.send_message(f"global synced: {[c.name for c in synced]}", ephemeral=True)
+
 # ===== HRS用：通常メッセージの自動収集 =====
 def _in_targets(message: discord.Message, targets: set[int]) -> bool:
     cid = getattr(message.channel, "id", None)
-    pid = getattr(getattr(message.channel, "parent", None), "id", None)
+    pid = getattr(getattr(message.channel, "parent", None), "id", None)  # スレッド親
     return bool(targets) and (cid in targets or (pid and pid in targets))
 
 @bot.event
@@ -222,7 +233,6 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    # HRSのみ自動収集
     if _in_targets(message, HRS_IDS) and GAS_URL:
         payload = {
             "token": GAS_KEY,
@@ -266,7 +276,7 @@ async def on_ready():
         bot.add_view(PersistentTagView(cid))
     print("[ready] persistent views registered")
 
-    # ヘルスHTTP
+    # ヘルスHTTP（多重起動ガード）
     if not getattr(bot, "_web_started", False):
         bot._web_started = True
         bot.loop.create_task(start_web())
