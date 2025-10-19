@@ -1,4 +1,8 @@
 # bot.py —— HRS(全ログ) / QBOX(モーダルのみ) / HEALTH(モーダル→health_logs) + ヘルスHTTP
+# 依存: discord.py>=2.3, python-dotenv, requests, aiohttp
+# 変数(.env or Railway Variables):
+#   DISCORD_TOKEN, GUILD_ID, GAS_URL, GAS_SHARED_TOKEN,
+#   CHANNEL_HRS(カンマ区切り), CHANNEL_QBOX(カンマ区切り), CHANNEL_HEALTH(カンマ区切り)
 
 import os, sys, traceback
 import discord
@@ -23,7 +27,7 @@ async def start_web():
     await site.start()
     print(f"[web] health server on :{port}")
 
-# ===== .env / Variables =====
+# ===== 環境変数 =====
 load_dotenv()
 TOKEN    = os.getenv("DISCORD_TOKEN")
 GUILD_ID = os.getenv("GUILD_ID")
@@ -31,13 +35,11 @@ GAS_URL  = os.getenv("GAS_URL")
 GAS_KEY  = os.getenv("GAS_SHARED_TOKEN", "")
 
 def _parse_ids(s: str | None) -> set[int]:
-    if not s:
-        return set()
-    out = set()
+    if not s: return set()
+    out: set[int] = set()
     for part in s.split(","):
         p = part.strip()
-        if not p:
-            continue
+        if not p: continue
         try:
             out.add(int(p))
         except ValueError:
@@ -79,8 +81,8 @@ STYLE_ROTATION = [
 class TagInputModal(ui.Modal, title="記録内容を入力"):
     def __init__(self, tag_text: str, sheet_key: str):
         super().__init__(timeout=300)
-        self.tag_text = tag_text
-        self.sheet_key = sheet_key   # "default" or "health"
+        self.tag_text = tag_text          # 例: "#質問 "
+        self.sheet_key = sheet_key        # "default" or "health"
         self.text = ui.TextInput(
             label="本文（任意）",
             style=discord.TextStyle.paragraph,
@@ -91,6 +93,7 @@ class TagInputModal(ui.Modal, title="記録内容を入力"):
         self.add_item(self.text)
 
     async def on_submit(self, interaction: discord.Interaction):
+        # 3秒以内ACK
         try:
             await interaction.response.defer(ephemeral=True, thinking=True)
         except Exception:
@@ -202,15 +205,17 @@ async def _log(interaction: discord.Interaction, content: str):
 async def _ping(interaction: discord.Interaction):
     await interaction.response.send_message("pong", ephemeral=True)
 
-@bot.tree.command(name="sync", description="コマンド同期（権限者のみ）")
+@bot.tree.command(name="sync", description="コマンド同期（手動）")
 async def _sync(interaction: discord.Interaction):
-    gid = os.getenv("GUILD_ID")
-    if gid:
-        synced = await bot.tree.sync(guild=discord.Object(id=int(gid)))
-        await interaction.response.send_message(f"synced: {[c.name for c in synced]}", ephemeral=True)
-    else:
-        synced = await bot.tree.sync()
-        await interaction.response.send_message(f"global synced: {[c.name for c in synced]}", ephemeral=True)
+    try:
+        if GUILD_ID:
+            synced = await bot.tree.sync(guild=discord.Object(id=int(GUILD_ID)))
+            await interaction.response.send_message(f"synced: {[c.name for c in synced]}", ephemeral=True)
+        else:
+            synced = await bot.tree.sync()
+            await interaction.response.send_message(f"global synced: {[c.name for c in synced]}", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"sync error: {e}", ephemeral=True)
 
 # ===== HRS用：通常メッセージの自動収集 =====
 def _in_targets(message: discord.Message, targets: set[int]) -> bool:
@@ -233,6 +238,7 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
+    # HRSのみ自動収集
     if _in_targets(message, HRS_IDS) and GAS_URL:
         payload = {
             "token": GAS_KEY,
@@ -247,24 +253,10 @@ async def on_message(message: discord.Message):
         except Exception as e:
             print("[on_message POST error]:", e)
 
+    # これがないと /ping /tags_pin /log /sync が反応しなくなる
     await bot.process_commands(message)
 
-# ===== 同期 & 起動 =====
-@bot.event
-async def setup_hook():
-    try:
-        if GUILD_ID:
-            guild = discord.Object(id=int(GUILD_ID))
-            bot.tree.copy_global_to(guild=guild)
-            synced = await bot.tree.sync(guild=guild)
-            print(f"[sync] to guild {GUILD_ID}: {[c.name for c in synced]}")
-        else:
-            synced = await bot.tree.sync()
-            print(f"[sync] global: {[c.name for c in synced]}")
-    except Exception:
-        print("[sync][ERROR]")
-        traceback.print_exc()
-
+# ===== on_ready（1つだけ！） =====
 @bot.event
 async def on_ready():
     print(f"[ready] Logged in as {bot.user} (id={bot.user.id})")
@@ -275,6 +267,17 @@ async def on_ready():
     for cid in TAG_SETS.keys():
         bot.add_view(PersistentTagView(cid))
     print("[ready] persistent views registered")
+
+    # 自動 slash 同期（guild優先）
+    try:
+        if GUILD_ID:
+            synced = await bot.tree.sync(guild=discord.Object(id=int(GUILD_ID)))
+            print(f"[ready] slash commands synced: {[c.name for c in synced]}")
+        else:
+            synced = await bot.tree.sync()
+            print(f"[ready] slash commands global synced: {[c.name for c in synced]}")
+    except Exception as e:
+        print("[ready][ERROR] slash command sync failed:", e)
 
     # ヘルスHTTP（多重起動ガード）
     if not getattr(bot, "_web_started", False):
@@ -289,3 +292,4 @@ except Exception:
     print("[run][FATAL] uncaught exception")
     traceback.print_exc()
     sys.exit(1)
+
