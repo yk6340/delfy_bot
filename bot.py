@@ -93,7 +93,6 @@ class TagInputModal(ui.Modal, title="記録内容を入力"):
         self.add_item(self.text)
 
     async def on_submit(self, interaction: discord.Interaction):
-        # 3秒以内ACK
         try:
             await interaction.response.defer(ephemeral=True, thinking=True)
         except Exception:
@@ -292,4 +291,3 @@ except Exception:
     print("[run][FATAL] uncaught exception")
     traceback.print_exc()
     sys.exit(1)
-
